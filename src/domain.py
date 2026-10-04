@@ -10,7 +10,12 @@ class ValidationError(DomainError): kind=ErrorKind.VALIDATION
 class NotFoundError(DomainError): kind=ErrorKind.NOT_FOUND
 class PermissionDenied(DomainError): kind=ErrorKind.FORBIDDEN
 class ConflictError(DomainError): kind=ErrorKind.CONFLICT
-SEVERITIES=['low', 'moderate', 'high', 'extreme']; STATES=['reported', 'active', 'contained', 'controlled', 'closed']; ROLES=['field_commander', 'incident_commander', 'logistics', 'viewer']
+SEVERITIES=['low', 'moderate', 'high', 'extreme']; STATES=['reported', 'active', 'contained', 'controlled', 'closed']; ROLES=['field_commander', 'incident_commander', 'deputy_commander', 'logistics', 'viewer']
+# 关闭签认生命周期：pending（已提交待二次确认）→ active（当前有效签认）→ consumed（已用于关闭）；
+# invalidated（观察/交接窗口版本变化导致失效）、rejected（窗口外越权或依据过期，被拒绝）为终态。
+SIGNOFF_STATUSES=['pending','active','invalidated','rejected','consumed']
+OPEN_SIGNOFF_STATUSES=['pending','active']
+WIND_DIRS=['N','NE','E','SE','S','SW','W','NW']
 @dataclass(frozen=True)
 class Item:
     id:int; title:str; description:str; severity:str; quantity:float; threshold:float; status:str; version:int; external_ref:Optional[str]; created_by:str; created_at:str; updated_at:str

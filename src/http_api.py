@@ -89,6 +89,11 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/signoffs"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.signoff_view(item_id, role))
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -97,7 +102,11 @@ def make_handler(service: Service, static_dir: str):
                 elif path == "/api/audit":
                     actor, role = self._identity()
                     del actor
-                    self._json(200, {"events": service.audit(role)})
+                    qs = parse_qs(urlparse(self.path).query)
+                    item_filter = qs.get("item_id", [None])[0]
+                    if item_filter is not None:
+                        item_filter = int(item_filter)
+                    self._json(200, {"events": service.audit(role, item_filter)})
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -113,6 +122,24 @@ def make_handler(service: Service, static_dir: str):
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/observation"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.update_observation(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/handover"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.handover(item_id, body, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/signoffs"):
+                    item_id = int(path.split("/")[3])
+                    self._json(201, service.submit_signoff(item_id, body, actor, role))
+                elif "/signoffs/" in path and path.endswith("/confirm"):
+                    item_id = int(path.split("/")[3])
+                    signoff_id = int(path.split("/")[5])
+                    self._json(200, service.confirm_signoff(
+                        item_id, signoff_id, actor, role))
+                elif path.startswith("/api/items/") and path.endswith("/signoffs/close"):
+                    item_id = int(path.split("/")[3])
+                    self._json(200, service.close_with_signoff(
+                        item_id, body, actor, role))
                 elif path.startswith("/api/items/") and path.endswith("/transition"):
                     item_id = int(path.split("/")[3])
                     target = body.get("target")

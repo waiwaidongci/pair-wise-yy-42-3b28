@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -65,6 +66,48 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
+                    task_zone TEXT NOT NULL,
+                    wind_dir TEXT NOT NULL,
+                    wind_speed REAL NOT NULL DEFAULT 0,
+                    note TEXT NOT NULL DEFAULT '',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    updated_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS handovers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    from_actor TEXT NOT NULL,
+                    from_role TEXT NOT NULL,
+                    to_actor TEXT NOT NULL,
+                    to_role TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_handovers_item ON handovers(item_id, id);
+                CREATE TABLE IF NOT EXISTS signoffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('pending','active','invalidated','rejected','consumed')),
+                    observation_version INTEGER NOT NULL,
+                    handover_version INTEGER NOT NULL,
+                    basis_wind_dir TEXT NOT NULL,
+                    submitted_by TEXT NOT NULL,
+                    submitted_role TEXT NOT NULL,
+                    confirmed_by TEXT,
+                    failure_reason TEXT NOT NULL DEFAULT '',
+                    invalidated_by_kind TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_signoffs_item ON signoffs(item_id, id);
             """)
 
     @staticmethod
@@ -123,6 +166,26 @@ class Repository:
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
 
+    def update_status_conn(self, conn: sqlite3.Connection, item_id: int, target: str,
+                           expected_version: Optional[int] = None) -> None:
+        now = utc_now()
+        if expected_version is None:
+            cur = conn.execute(
+                "UPDATE items SET status=?, version=version+1, updated_at=? WHERE id=?",
+                (target, now, item_id),
+            )
+        else:
+            cur = conn.execute(
+                """UPDATE items SET status=?, version=version+1, updated_at=?
+                   WHERE id=? AND version=?""",
+                (target, now, item_id, expected_version),
+            )
+        if cur.rowcount == 0:
+            exists = conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
+            if exists is None:
+                raise NotFoundError("项目不存在")
+            raise ConflictError("版本冲突，请刷新后重试")
+
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:
         now = utc_now()
@@ -157,24 +220,39 @@ class Repository:
             ).fetchone()
         return int(row["n"])
 
+    @contextmanager
+    def transaction(self):
+        """串行化所有写操作；with 块正常结束时统一提交，异常时回滚。"""
+        with self._lock:
+            try:
+                yield self.conn
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def _insert_audit(self, conn: sqlite3.Connection, action: str, entity_type: str,
+                      entity_id: int, actor: str, detail: dict) -> Dict[str, Any]:
+        row = conn.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        previous = row["entry_hash"] if row else "GENESIS"
+        event = make_entry(action, entity_type, entity_id, actor, detail, previous)
+        cur = conn.execute(
+            """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+               previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+             json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+             event["previous_hash"], event["entry_hash"], event["created_at"]),
+        )
+        event["id"] = int(cur.lastrowid)
+        return event
+
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
         with self._lock, self.conn:
-            row = self.conn.execute(
-                "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
-            ).fetchone()
-            previous = row["entry_hash"] if row else "GENESIS"
-            event = make_entry(action, entity_type, entity_id, actor, detail, previous)
-            cur = self.conn.execute(
-                """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
-                   previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
-                (event["action"], event["entity_type"], event["entity_id"], event["actor"],
-                 json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
-                 event["previous_hash"], event["entry_hash"], event["created_at"]),
-            )
-            event_id = int(cur.lastrowid)
-        event["id"] = event_id
-        return event
+            return self._insert_audit(self.conn, action, entity_type, entity_id,
+                                      actor, detail)
 
     def list_audit(self, entity_id: Optional[int] = None) -> List[Dict[str, Any]]:
         sql = "SELECT * FROM audit_events"
@@ -209,6 +287,123 @@ class Repository:
                 return False
             previous = row["entry_hash"]
         return True
+
+    # ---- 观察窗口 / 交接窗口 / 关闭签认 ----
+
+    def get_observation(self, conn: sqlite3.Connection, item_id: int) -> Optional[Dict[str, Any]]:
+        row = conn.execute("SELECT * FROM observations WHERE item_id=?", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+    def upsert_observation(self, conn: sqlite3.Connection, item_id: int, task_zone: str,
+                           wind_dir: str, wind_speed: float, note: str,
+                           actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        existing = self.get_observation(conn, item_id)
+        if existing is None:
+            conn.execute(
+                """INSERT INTO observations(item_id, task_zone, wind_dir, wind_speed, note,
+                   version, updated_by, created_at, updated_at)
+                   VALUES(?,?,?,?,?,1,?,?,?)""",
+                (item_id, task_zone, wind_dir, wind_speed, note, actor, now, now),
+            )
+        else:
+            conn.execute(
+                """UPDATE observations SET task_zone=?, wind_dir=?, wind_speed=?, note=?,
+                   version=version+1, updated_by=?, updated_at=? WHERE item_id=?""",
+                (task_zone, wind_dir, wind_speed, note, actor, now, item_id),
+            )
+        return self.get_observation(conn, item_id)
+
+    def latest_handover(self, conn: sqlite3.Connection, item_id: int) -> Optional[Dict[str, Any]]:
+        row = conn.execute(
+            "SELECT * FROM handovers WHERE item_id=? ORDER BY id DESC LIMIT 1", (item_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def insert_handover(self, conn: sqlite3.Connection, item_id: int, version: int,
+                        from_actor: str, from_role: str, to_actor: str, to_role: str,
+                        reason: str) -> Dict[str, Any]:
+        now = utc_now()
+        conn.execute("UPDATE handovers SET active=0 WHERE item_id=? AND active=1", (item_id,))
+        cur = conn.execute(
+            """INSERT INTO handovers(item_id, version, from_actor, from_role, to_actor,
+               to_role, reason, active, created_at) VALUES(?,?,?,?,?,?,?,1,?)""",
+            (item_id, version, from_actor, from_role, to_actor, to_role, reason, now),
+        )
+        row = conn.execute("SELECT * FROM handovers WHERE id=?", (int(cur.lastrowid),)).fetchone()
+        return dict(row)
+
+    def invalidate_open_signoffs(self, conn: sqlite3.Connection, item_id: int,
+                                 kind: str, reason: str) -> List[int]:
+        """观察或交接窗口一变，所有未完成签认（pending/active）立即失效。"""
+        now = utc_now()
+        rows = conn.execute(
+            """SELECT id FROM signoffs WHERE item_id=? AND status IN ('pending','active')""",
+            (item_id,),
+        ).fetchall()
+        ids = [int(r["id"]) for r in rows]
+        if ids:
+            conn.execute(
+                """UPDATE signoffs SET status='invalidated', failure_reason=?,
+                   invalidated_by_kind=?, updated_at=?
+                   WHERE item_id=? AND status IN ('pending','active')""",
+                (reason, kind, now, item_id),
+            )
+        return ids
+
+    def insert_signoff(self, conn: sqlite3.Connection, item_id: int, status: str,
+                       obs_version: int, handover_version: int, wind_dir: str,
+                       actor: str, role: str, failure_reason: str = "") -> Dict[str, Any]:
+        now = utc_now()
+        cur = conn.execute(
+            """INSERT INTO signoffs(item_id, status, observation_version, handover_version,
+               basis_wind_dir, submitted_by, submitted_role, confirmed_by, failure_reason,
+               invalidated_by_kind, created_at, updated_at)
+               VALUES(?,?,?,?,?,?,?,NULL,?,'',?,?)""",
+            (item_id, status, obs_version, handover_version, wind_dir, actor, role,
+             failure_reason, now, now),
+        )
+        return self.get_signoff(conn, int(cur.lastrowid))
+
+    def get_signoff(self, conn: sqlite3.Connection, signoff_id: int) -> Dict[str, Any]:
+        row = conn.execute("SELECT * FROM signoffs WHERE id=?", (signoff_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("签认不存在")
+        return dict(row)
+
+    def list_signoffs(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM signoffs WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def active_signoff(self, conn: sqlite3.Connection, item_id: int) -> Optional[Dict[str, Any]]:
+        row = conn.execute(
+            "SELECT * FROM signoffs WHERE item_id=? AND status='active' ORDER BY id DESC LIMIT 1",
+            (item_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def confirm_signoff(self, conn: sqlite3.Connection, signoff_id: int,
+                        confirmer: str) -> Dict[str, Any]:
+        now = utc_now()
+        conn.execute(
+            "UPDATE signoffs SET status='active', confirmed_by=?, updated_at=? WHERE id=?",
+            (confirmer, now, signoff_id),
+        )
+        return self.get_signoff(conn, signoff_id)
+
+    def consume_active_signoff(self, conn: sqlite3.Connection, item_id: int) -> Optional[Dict[str, Any]]:
+        active = self.active_signoff(conn, item_id)
+        if active is None:
+            return None
+        now = utc_now()
+        conn.execute(
+            "UPDATE signoffs SET status='consumed', updated_at=? WHERE id=?",
+            (now, active["id"]),
+        )
+        return self.get_signoff(conn, active["id"])
 
     def close(self) -> None:
         with self._lock:
