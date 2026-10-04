@@ -65,6 +65,40 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    version INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    detail TEXT NOT NULL,
+                    recorded_by TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    UNIQUE(item_id, version)
+                );
+                CREATE TABLE IF NOT EXISTS handovers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    window_version INTEGER NOT NULL,
+                    from_actor TEXT NOT NULL,
+                    from_role TEXT NOT NULL,
+                    to_actor TEXT NOT NULL,
+                    to_role TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, window_version)
+                );
+                CREATE TABLE IF NOT EXISTS signoffs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    observation_version INTEGER NOT NULL,
+                    handover_window INTEGER NOT NULL,
+                    signer_actor TEXT NOT NULL,
+                    signer_role TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'valid'
+                        CHECK(status IN ('valid','consumed','expired')),
+                    created_at TEXT NOT NULL,
+                    consumed_at TEXT
+                );
             """)
 
     @staticmethod
@@ -209,6 +243,120 @@ class Repository:
                 return False
             previous = row["entry_hash"]
         return True
+
+    # -- 任务区观察：每次记录推进观察版本，关闭签认必须基于当前观察版本 --
+    def current_observation_version(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(version),0) AS v FROM observations WHERE item_id=?",
+                (item_id,),
+            ).fetchone()
+        return int(row["v"])
+
+    def add_observation(self, item_id: int, version: int, kind: str, detail: str,
+                        actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO observations(item_id, version, kind, detail, recorded_by, recorded_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (item_id, version, kind, detail, actor, now),
+            )
+            obs_id = int(cur.lastrowid)
+            row = self.conn.execute("SELECT * FROM observations WHERE id=?", (obs_id,)).fetchone()
+        return dict(row)
+
+    def list_observations(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM observations WHERE item_id=? ORDER BY version", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- 角色交接：交接双方共同形成一个授权窗口，窗口一变旧签认即失效 --
+    def latest_handover(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM handovers WHERE item_id=? ORDER BY window_version DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def add_handover(self, item_id: int, window: int, from_actor: str, from_role: str,
+                     to_actor: str, to_role: str, reason: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO handovers(item_id, window_version, from_actor, from_role,
+                   to_actor, to_role, reason, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (item_id, window, from_actor, from_role, to_actor, to_role, reason, now),
+            )
+            hid = int(cur.lastrowid)
+            row = self.conn.execute("SELECT * FROM handovers WHERE id=?", (hid,)).fetchone()
+        return dict(row)
+
+    def list_handovers(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM handovers WHERE item_id=? ORDER BY window_version", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # -- 关闭签认：绑定观察版本与交接窗口，过期即失效，关闭时消耗 --
+    def expire_valid_signoffs(self, item_id: int) -> List[Dict[str, Any]]:
+        with self._lock, self.conn:
+            rows = self.conn.execute(
+                "SELECT * FROM signoffs WHERE item_id=? AND status='valid'", (item_id,)
+            ).fetchall()
+            expired = [dict(r) for r in rows]
+            self.conn.execute(
+                "UPDATE signoffs SET status='expired' WHERE item_id=? AND status='valid'",
+                (item_id,),
+            )
+        return expired
+
+    def create_signoff(self, item_id: int, observation_version: int, handover_window: int,
+                       actor: str, role: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE signoffs SET status='expired' WHERE item_id=? AND status='valid'",
+                (item_id,),
+            )
+            cur = self.conn.execute(
+                """INSERT INTO signoffs(item_id, observation_version, handover_window,
+                   signer_actor, signer_role, status, created_at)
+                   VALUES(?,?,?,?,?, 'valid', ?)""",
+                (item_id, observation_version, handover_window, actor, role, now),
+            )
+            sid = int(cur.lastrowid)
+            row = self.conn.execute("SELECT * FROM signoffs WHERE id=?", (sid,)).fetchone()
+        return dict(row)
+
+    def latest_signoff(self, item_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM signoffs WHERE item_id=? ORDER BY id DESC LIMIT 1", (item_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def consume_signoff(self, signoff_id: int) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE signoffs SET status='consumed', consumed_at=? WHERE id=? AND status='valid'",
+                (now, signoff_id),
+            )
+
+    def list_signoffs(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM signoffs WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def close(self) -> None:
         with self._lock:

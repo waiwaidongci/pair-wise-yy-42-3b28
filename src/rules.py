@@ -4,6 +4,14 @@ TITLE='山火事件指挥与离线人员调度'; ENTITY='山火事件'; ID_PREFI
 SEVERITIES=['low', 'moderate', 'high', 'extreme']; STATES=['reported', 'active', 'contained', 'controlled', 'closed']; TRANSITIONS={'reported': ['active'], 'active': ['contained'], 'contained': ['controlled'], 'controlled': ['closed'], 'closed': []}; TRANSITION_ROLES={'active': ['incident_commander'], 'contained': ['incident_commander'], 'controlled': ['incident_commander'], 'closed': ['incident_commander']}
 CREATE_ROLES=set(['field_commander']); RECORD_ROLES=set(['field_commander', 'logistics']); AUDIT_ROLES=set(['incident_commander', 'viewer']); VIEW_ROLES=set(['field_commander', 'incident_commander', 'logistics', 'viewer'])
 SEVERITY_WEIGHT={'low': 1.0, 'moderate': 3.0, 'high': 6.0, 'extreme': 9.0}; DEADLINE_HOURS={'low': 72, 'moderate': 24, 'high': 8, 'extreme': 4}; TERMINAL_STATES=set(['closed'])
+# 任务区观察：风向、风速、火情、态势等，每次记录都推进观察版本，关闭签认必须基于当前观察版本。
+OBSERVATION_KINDS=['wind_direction', 'wind_speed', 'fire_front', 'situation', 'weather']; OBSERVATION_ROLES=set(['field_commander', 'incident_commander'])
+# 关闭签认状态：valid=当前有效；consumed=已用于关闭；expired=观察或交接窗口变更后失效。
+SIGNOFF_STATUSES=['valid', 'consumed', 'expired']
+# 角色交接：只有当前值守指挥员可以把关闭权限交给接方。
+HANDOVER_ROLES=set(['incident_commander'])
+# 默认交接窗口（未发生交接时）授权的关闭签认角色。
+DEFAULT_CLOSURE_ROLE='incident_commander'
 def priority_score(severity,quantity=0.0,threshold=1.0,open_records=0):
     if severity not in SEVERITY_WEIGHT: raise ValidationError("unknown severity")
     ratio=quantity/threshold if threshold>0 else 1.0
